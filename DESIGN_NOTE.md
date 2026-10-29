@@ -4,7 +4,7 @@ Due Wed Oct 28, 11:59 pm. See specification Section 7.
 
 
 1. Components / threads:
-- MainWindow (GUI thread only) - owns the workspace, the current corpus is std::unique_ptr<ProcessingCore> corpus_ (null when there is no current corpus), a std::uint64_t generation_ counter, the corpus state, and one CorpusBuilder. Every slot, including the new build_finished() slot, runs on the GUI thread and only MainWindow touches widgets.
+- MainWindow (GUI thread only) - owns the workspace, the current corpus is std::unique_ptr<ProcessingCore> corpus_ (null when there is no current corpus), a std::uint64_t generation_ counter, the corpus state, and one CorpusBuilder. Every slot, including the new build_finished(quint64generation) slot, runs on the GUI thread and only MainWindow touches widgets.
 - CorpusBuilder(new class, no QT widgets) - start() and finish() run on the GUI thread. start() copies the Workspace and triggers on std::thread that runs run(). run() is the only function on the worker thread and it builds a brand new ProcessingCore from the copy, stores result in std::promise, and calls QMetaObject::invokeMethod(main_window, "build_finished", Qt::QueuedConnection, generation). finish() will join the thread and call future.get(). the destuctor sets the cancel flag and joins
 - DelaydCHunking(new ChunkingStrategy wrapper). Its chunk() runs on the worker thread inside rebuild() once per document. It sleep the --build-delay-ms value in 10ms steps, checks the cancel flag between each step, then calls the real Chunker. This will slow the real build path without ever touching the GUI thread.
 Shared data - the worker will get its own copy of the Workspace, the generation number, and the delay by value, so it never reads GUI data. Only two things are shared. the std::atomic<bool> cancel flag is written by GUI thread and read by worker which is safe bc it is atomic. And the promise/future shared state is written once by the worker and read by the GUI thread only after build_finished arrives, which is safe because std::future synchronizes it.
@@ -18,7 +18,7 @@ Building: a thread is running and its result is wanted. Search, term inspector, 
 Discarding: a thread is still runing but the workspace changed or reset was clicked, so its result will be thrown away. build stays disabled
 Current: corpus_ matches the workspace. Chunk count is shown and search, term inspector, and context are enabled
 
-States:
+Events:
 NotBuilt -> Building: Build Corpus clicked
 
 Building -> Current: build_finished with a matching generation and a successful result
