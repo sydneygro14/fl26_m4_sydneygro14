@@ -52,7 +52,7 @@ std::string default_socket_path() {
 void print_usage() {
 
     std::cerr << "usage: aiws_send [--socket PATH] add FILE\n";
-}
+} 
 
 
 // this function reads and checks the command line arguments
@@ -114,14 +114,7 @@ bool parse_options(int argc, char* argv[], SendOptions& options) {
 
 
 
-
-
-
-
-
-
-
-
+////////// PAIR PROGRAMMING ///////////////
 
 // sends all the bytes in a message
 // send might only send some of the bytes
@@ -130,28 +123,39 @@ bool parse_options(int argc, char* argv[], SendOptions& options) {
 bool send_all(int socket_fd, const char* data, std::size_t size) {
 
     // start with zero bytes sent
-
+    std::size_t total_sent = 0;
 
     // keep sending while there are bytes left
-
+    while (total_sent < size) {
 
         // send the bytes that have not been sent yet
-
+        ssize_t sent = send(
+            socket_fd,           // the socket we are sending through
+            data + total_sent,   // start at the first unsent byte
+            size - total_sent,   // number of bytes still left to send
+            MSG_NOSIGNAL         // stops a broken connection from ending the program
+        );
 
         // check if some bytes were sent
-
+        if (sent > 0) {
 
             // add the new bytes to the total
+            total_sent += static_cast<std::size_t>(sent);
 
+        } else if (sent < 0 && errno == EINTR) {
 
-        // try again if the call was interrupted
+            // try again if the call was interrupted
+            continue;
 
+        } else {
 
-        // stop if sending failed
-
+            // stop if sending failed
+            return false;
+        }
+    }
 
     // return true because all bytes were sent
-
+    return true;
 }
 
 
@@ -163,25 +167,40 @@ bool send_all(int socket_fd, const char* data, std::size_t size) {
 bool send_add_request(int socket_fd, const std::string& file_path) {
 
     // check if the path length fits in four bytes
-
+    if (file_path.size() > std::numeric_limits<uint32_t>::max()) {
+        return false; // stop if the path is too long
+    }
 
     // use a to represent the add command
-
+    char command = 'A';
 
     // convert the path length to network byte order
-
+    uint32_t path_length =
+        htonl(static_cast<uint32_t>(file_path.size()));
 
     // send the add command
-
+    if (!send_all(socket_fd, &command, 1)) {
+        return false; // stop if the command could not be sent
+    }
 
     // send the four bytes containing the path length
-
+    if (!send_all(
+            socket_fd,                                    // the socket connection
+            reinterpret_cast<const char*>(&path_length), // treat the number as bytes
+            sizeof(path_length))) {                       // send all four bytes
+        return false; // stop if the length could not be sent
+    }
 
     // send the document path
-
+    if (!send_all(
+            socket_fd,           // the socket connection
+            file_path.data(),    // location of the path text in memory
+            file_path.size())) { // number of bytes in the file path
+        return false; // stop if the path could not be sent
+    }
 
     // return true because the request was sent
-
+    return true;
 }
 
 
@@ -192,28 +211,39 @@ bool send_add_request(int socket_fd, const std::string& file_path) {
 bool receive_all(int socket_fd, char* data, std::size_t size) {
 
     // start with zero bytes received
-
+    std::size_t total_received = 0;
 
     // keep receiving while there are bytes left
-
+    while (total_received < size) {
 
         // receive the remaining bytes
-
+        ssize_t received = recv(
+            socket_fd,                  // the socket we are reading from
+            data + total_received,      // where the next bytes should go
+            size - total_received,      // number of bytes still needed
+            0                           // use normal receiving behavior
+        );
 
         // check if some bytes were received
-
+        if (received > 0) {
 
             // add the new bytes to the total
+            total_received += static_cast<std::size_t>(received);
 
+        } else if (received < 0 && errno == EINTR) {
 
-        // try again if the call was interrupted
+            // try again if the call was interrupted
+            continue;
 
+        } else {
 
-        // stop if the connection closed or failed
-
+            // stop if the connection closed or failed
+            return false;
+        }
+    }
 
     // return true because all bytes were received
-
+    return true;
 }
 
 
@@ -223,43 +253,62 @@ bool receive_all(int socket_fd, char* data, std::size_t size) {
 bool receive_response(int socket_fd, int& status, std::string& reason) {
 
     // create a variable for the response status
-
+    unsigned char response_status = 0;
 
     // read the response status
-
+    if (!receive_all(
+            socket_fd,                                    // the socket connection
+            reinterpret_cast<char*>(&response_status),   // where the status is stored
+            1)) {                                         // read one byte
+        return false; // stop if the status could not be read
+    }
 
     // check that the status is accepted or rejected
-
+    if (response_status != 0 && response_status != 1) {
+        return false; // stop if the status is invalid
+    }
 
     // create a variable for the reason length
-
+    uint32_t reason_length = 0;
 
     // read the four bytes containing the reason length
-
+    if (!receive_all(
+            socket_fd,                                  // the socket connection
+            reinterpret_cast<char*>(&reason_length),   // where the length is stored
+            sizeof(reason_length))) {                   // read four bytes
+        return false; // stop if the length could not be read
+    }
 
     // convert the length into the computers byte order
-
+    reason_length = ntohl(reason_length);
 
     // check that the reason is not too large
-
+    if (reason_length > 65536) {
+        return false; // stop if the response is too large
+    }
 
     // create a string with enough space for the reason
-
+    std::string message(reason_length, '\0');
 
     // read the reason text if there is any
-
+    if (reason_length > 0) {
 
         // read the reason into the string
-
+        if (!receive_all(
+                socket_fd,          // the socket connection
+                message.data(),     // where the reason text is stored
+                message.size())) {  // number of bytes to read
+            return false; // stop if the reason could not be read
+        }
+    }
 
     // save the status and reason
-
+    status = response_status;
+    reason = message;
 
     // return true because the response was received
-
+    return true;
 }
-
-
 
 
 

@@ -55,3 +55,8 @@ add_executable(student_tests tests/student_tests.cpp)
 target_link_libraries(student_tests PRIVATE aiws_app Qt6::Test)
 add_test(NAME student_tests COMMAND student_tests)
 set_tests_properties(student_tests PROPERTIES TIMEOUT 60 ENVIRONMENT QT_QPA_PLATFORM=offscreen)
+
+
+add_executable(aiws_send
+    tools/aiws_send.cpp
+)
