@@ -28,6 +28,7 @@ target_compile_options(aiws_m2 PRIVATE -Wall -Wextra -Wpedantic)
 
 # Everything except main(), so tests can link the application code.
 add_library(aiws_app STATIC
+    src/remote_add_server.cpp
     src/main_window.cpp
     src/workspace_widget.cpp
     src/search_widget.cpp
@@ -43,7 +44,7 @@ add_library(aiws_app STATIC
     include/aiws/gui/search_result_model.hpp
 )
 target_include_directories(aiws_app PUBLIC include)
-target_link_libraries(aiws_app PUBLIC aiws_m2 Qt6::Widgets)
+target_link_libraries(aiws_app PUBLIC aiws_m2 Qt6::Widgets Threads::Threads)
 target_compile_options(aiws_app PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(ai_workspace_m4 src/main.cpp)

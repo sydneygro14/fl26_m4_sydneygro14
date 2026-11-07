@@ -1,6 +1,13 @@
 #pragma once
 
 #include <QMainWindow>
+#include <future>
+#include <memory>
+#include <string>
+#include <cstdint>
+#include <atomic>
+#include <QTimer>
+#include "aiws/remote_add_server.hpp"
 
 #include "aiws/processing_core.hpp"
 #include "aiws/workspace.hpp"
@@ -49,7 +56,11 @@ public:
      * @param callback Function pointer to invoke for the Exit action. A null
      * callback means that an Exit request has no registered callback to invoke.
      */
+    ~MainWindow() override;
     void set_exit_callback(ExitCallback callback) noexcept;
+    bool start_remote_add(const std::string& socket_path);
+    // this hook makes the failure path deterministic in student tests
+    void fail_next_build_for_test();
 
     // ---- M4 required public API (see specification, Section 5) ----------
 
@@ -71,6 +82,7 @@ public:
 private slots:
     /** @brief Handles a request to select and add a document to the workspace. */
     void add_document();
+    void poll_build();
 
     /** @brief Rebuilds the processing corpus from the current non-empty workspace. */
     void build_corpus();
@@ -142,6 +154,20 @@ private:
      */
     void clear_processing_outputs();
 
+    struct BuildResult {
+        ProcessingCore corpus;
+        std::string error;
+    };
+    // only the gui thread owns these members
+    std::future<BuildResult> build_future_;
+    std::shared_ptr<std::atomic<bool>> build_cancel_;
+    QTimer* build_timer_{nullptr};
+    std::uint64_t workspace_generation_{0};
+    std::uint64_t build_generation_{0};
+    bool building_{false};
+    bool force_failure_next_{false};
+    int build_delay_ms_{0};
+    std::unique_ptr<aiws::RemoteAddServer> remote_add_server_;
     Workspace workspace_;
     ProcessingCore processing_core_;
     bool corpus_current_{false};

@@ -1,4 +1,4 @@
-# M3
+// m3 code reused for m4
 
 
 #include "aiws/gui/search_widget.hpp"

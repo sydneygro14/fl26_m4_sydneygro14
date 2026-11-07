@@ -1,4 +1,4 @@
-# M3
+// m3 code reused for m4
 
 
 #include "aiws/gui/main_window.hpp"
@@ -8,6 +8,15 @@
 #include "aiws/gui/term_inspector_widget.hpp"
 #include "aiws/gui/workspace_widget.hpp"
 
+#include <QMetaObject>
+#include <QFileDevice>
+#include <QTimer>
+#include <chrono>
+#include <future>
+#include <thread>
+#include <algorithm>
+#include <memory>
+#include "aiws/remote_add_server.hpp"
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -34,7 +43,7 @@ const QString kCorpusNotBuilt = QStringLiteral("Corpus: Not built");
 
 }  // namespace
 
-MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) { # constructor
+MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) { // constructor
     setWindowTitle("AI Workspace");
 
     // the four components plus the status row controls
@@ -96,6 +105,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) { # constructor
     connect(search_widget_, &SearchWidget::selected_chunk_changed,
             term_inspector_widget_, &TermInspectorWidget::set_selected_chunk);
 
+    build_timer_ = new QTimer(this);
+    build_timer_->setInterval(15);
+    connect(build_timer_, &QTimer::timeout, this, &MainWindow::poll_build);
     update_action_states();
 }
 
@@ -103,60 +115,175 @@ void MainWindow::set_exit_callback(ExitCallback callback) noexcept {
     exit_callback_ = callback; // exit_callback_ checks the "if (exit_callback_)"
 }
 
-void MainWindow::add_document() {
-    const QString path = QFileDialog::getOpenFileName(this, "Add Document", QString(),
-                                                      "Text files (*.txt);;All files (*)"); // opens file dialog
-    if (path.isEmpty()) return;     // if user cancels dialog, nothing happens
-
-    // absolute path is the document id so the same file cannot be added twice
+// this reads a file and changes nothing if it cannot be read
+bool MainWindow::add_document_file(const QString& path) {
+    if (path.isEmpty()) return false;
     const QFileInfo info(path);
-    const std::string id = info.absoluteFilePath().toStdString();
-    for (const Document& existing : workspace_.documents()) {
-        if (existing.id() == id) {
-            status_label_->setText("Already in workspace: " + info.fileName());ch
-            return;
-        }
-    } // checks if file has error when it opens
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) {
-        status_label_->setText("Could not read file: " + info.fileName());
-        return;
-    }
-
-    // raw bytes go to the backend untouched and the file name is the title
+    const QString full_path = info.absoluteFilePath();
+    QFile file(full_path);
+    if (!file.open(QIODevice::ReadOnly) || !info.isFile()) return false;
     const QByteArray bytes = file.readAll();
+    if (file.error() != QFileDevice::NoError) return false;
+    const std::string id = full_path.toStdString();
+    for (const Document& doc : workspace_.documents()) {
+        if (doc.id() == id) {
+            status_label_->setText("Already in workspace: " + info.fileName());
+            return true;
+        }
+    }
     workspace_.add_document(Document(id, info.fileName().toStdString(),
-                                     std::string(bytes.constData(), static_cast<std::size_t>(bytes.size()))));
-    workspace_widget_->add_document(info.fileName()); // adds document filename to screen
-
-    // the workspace changed so the old corpus and its output are stale
-    invalidate_corpus(); // sets current_corpus() to false + clears workspace (old resutls, stats, etc.)
-    update_action_states(); // -> greys out search, inspect, and build buttons so user can't select
+                       std::string(bytes.constData(), static_cast<std::size_t>(bytes.size()))));
+    workspace_widget_->add_document(info.fileName());
+    invalidate_corpus();
+    update_action_states();
     status_label_->setText("Added document: " + info.fileName() + " (build the corpus to search)");
+    return true;
 }
 
-// try/catch for BUILD_CORPUS 
-// current_corpus remains false
-    void MainWindow::build_corpus() {
-    // building needs at least one document
-    if (workspace_.documents().empty()) return;
+// the button and remote add both use the same file loading path
+void MainWindow::add_document() {
+    const QString path = QFileDialog::getOpenFileName(this, "Add Document", QString(),
+                                                       "Text files (*.txt);;All files (*)");
+    if (path.isEmpty()) return;
+    if (!add_document_file(path)) {
+        status_label_->setText("Could not read file: " + QFileInfo(path).fileName());
+    }
+}
+
+void MainWindow::set_build_delay_ms(int ms_per_document) {
+    build_delay_ms_ = std::max(0, ms_per_document);
+}
+
+void MainWindow::fail_next_build_for_test() {
+    force_failure_next_ = true;
+}
+
+// the actual rebuild runs on a standard library worker thread
+void MainWindow::build_corpus() {
+    if (workspace_.documents().empty() || building_) return;
+    // copy all input so changes and reset cannot change the worker data
+    Workspace snapshot = workspace_;
+    build_generation_ = workspace_generation_;
+    const int delay = build_delay_ms_;
+    build_cancel_ = std::make_shared<std::atomic<bool>>(false);
+    const auto cancel = build_cancel_;
+    const bool inject_failure = force_failure_next_;
+    force_failure_next_ = false;
+    building_ = true;
+    corpus_current_ = false;
+    clear_processing_outputs();
+    term_inspector_widget_->clear_statistics();
+    workspace_widget_->set_corpus_status("Corpus: Building...");
+    status_label_->setText("Building corpus...");
+    update_action_states();
     try {
-        processing_core_.rebuild(workspace_); // pulls from backend through build
+        build_future_ = std::async(std::launch::async,
+            [snapshot = std::move(snapshot), delay, inject_failure, cancel]() mutable -> BuildResult {
+                BuildResult result;
+                try {
+                    if (inject_failure) throw std::runtime_error("simulated build failure");
+                    // delay belongs to the worker instead of the gui
+                    for (std::size_t i = 0; i < snapshot.documents().size(); ++i) {
+                        // check cancellation during each artificial delay
+                        for (int elapsed = 0; elapsed < delay && !cancel->load(); elapsed += 10) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(std::min(10, delay - elapsed)));
+                        }
+                        if (cancel->load()) return result;
+                    }
+                    if (!cancel->load()) result.corpus.rebuild(snapshot);
+                } catch (const std::exception& error) {
+                    result.error = error.what();
+                } catch (...) {
+                    result.error = "unknown build failure";
+                }
+                return result;
+            });
+        build_timer_->start();
     } catch (const std::exception& error) {
-        // a failed rebuild leaves no current corpus
+        building_ = false;
         invalidate_corpus();
         update_action_states();
         status_label_->setText(QString("Build failed: ") + error.what());
+    }
+}
+
+// the gui checks completion without ever waiting for the worker
+void MainWindow::poll_build() {
+    if (!building_ || !build_future_.valid()) return;
+    if (build_future_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+    build_timer_->stop();
+    BuildResult result;
+    try {
+        result = build_future_.get();
+    } catch (const std::exception& error) {
+        result.error = error.what();
+    } catch (...) {
+        result.error = "unknown build failure";
+    }
+    // this fault intentionally keeps the application stuck in building state
+#ifndef AIWS_FAULT_LOSE_FAILURE
+    if (!result.error.empty() && build_generation_ == workspace_generation_) {
+        building_ = false;
+        invalidate_corpus();
+        update_action_states();
+        status_label_->setText(QString("Build failed: ") + QString::fromStdString(result.error));
         return;
     }
-// no error:
-    // fresh corpus replaces every old result selection statistic and context / wipes old content if try/catch is successful
+#else
+    if (!result.error.empty() && build_generation_ == workspace_generation_) {
+        // deliberately drop the failure notification and stay in building state
+        return;
+    }
+#endif
+    building_ = false;
+    // a completed build must match the exact workspace version it started with
+#ifndef AIWS_FAULT_ACCEPT_STALE
+    if (build_generation_ != workspace_generation_) {
+        update_action_states();
+        return;
+    }
+#endif
+    if (!result.error.empty()) {
+        invalidate_corpus();
+        update_action_states();
+        status_label_->setText(QString("Build failed: ") + QString::fromStdString(result.error));
+        return;
+    }
+    processing_core_ = std::move(result.corpus);
     clear_processing_outputs();
     term_inspector_widget_->clear_statistics();
     corpus_current_ = true;
     workspace_widget_->set_corpus_status(QString("Corpus: %1 chunks").arg(processing_core_.chunk_count()));
-    update_action_states(); // enables buttons
+    update_action_states();
     status_label_->setText("Corpus built");
+}
+
+// the socket server only queues work for the gui and never waits for it
+bool MainWindow::start_remote_add(const std::string& socket_path) {
+    if (remote_add_server_) return false;
+    auto server = std::make_unique<aiws::RemoteAddServer>(
+        [this](const std::string& path) {
+            const QString text = QString::fromUtf8(path.data(), static_cast<int>(path.size()));
+            QMetaObject::invokeMethod(this, [this, text]() {
+                add_document_file(text);
+            }, Qt::QueuedConnection);
+        });
+    std::string error;
+    if (!server->start(socket_path, error)) {
+        status_label_->setText(QString::fromStdString(error));
+        return false;
+    }
+    remote_add_server_ = std::move(server);
+    return true;
+}
+
+// stop listening and wait for the worker before deleting its owner
+MainWindow::~MainWindow() {
+    if (build_timer_) build_timer_->stop();
+    // cancel long simulated delays so exiting does not wait for them
+    if (build_cancel_) build_cancel_->store(true);
+    if (build_future_.valid()) build_future_.wait();
+    if (remote_add_server_) remote_add_server_->stop();
 }
 
 void MainWindow::document_selected(int row) {
@@ -239,6 +366,7 @@ void MainWindow::term_inspection_requested(const QString& term, const QString& c
 
 void MainWindow::reset_application() {
     // empty workspace and backend corpus before the components reset
+    ++workspace_generation_;
     workspace_.clear(); // clears workspace
     processing_core_.rebuild(workspace_); // "rebuilds" backend from nothing so it actually clears it
     corpus_current_ = false;
@@ -263,7 +391,7 @@ void MainWindow::update_action_states() {
     const bool has_documents = !workspace_.documents().empty(); // makes sure workspace has documents
     const bool has_query = search_widget_->has_query(); // makes sure there is a q
     // query typed
-    workspace_widget_->set_build_corpus_enabled(has_documents); // enables
+    workspace_widget_->set_build_corpus_enabled(has_documents && !building_); // enables
     search_widget_->set_search_enabled(corpus_current_ && has_query);
     term_inspector_widget_->set_inspection_enabled(corpus_current_);
     context_widget_->set_build_context_enabled(corpus_current_ && has_query);
@@ -271,6 +399,7 @@ void MainWindow::update_action_states() {
 
 void MainWindow::invalidate_corpus() {
     // old corpus and everything derived from it can no longer be used
+    ++workspace_generation_;
     corpus_current_ = false;
     clear_processing_outputs();
     term_inspector_widget_->clear_statistics();
