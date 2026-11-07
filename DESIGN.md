@@ -8,20 +8,14 @@
 
 **Changes since checkpoint.** The delayed rebuild moved into a standard-library worker. A timer checks completion. Remote Add introduced a separate Unix-domain socket thread and the same document-add invalidation path as the GUI. Existing M1/M2 interfaces and search/inspection logic did not change. This design is different from putting processing on the GUI thread, which would freeze document selection and Reset.
 
-**CR-1 protocol.** Sender request: one byte ASCII `A` (0x41), then a four-byte unsigned big-endian pathname byte length, then exactly that many raw UTF-8 pathname bytes (maximum 65,535). Response: one status byte (`0` accepted, `1` rejected), four-byte unsigned big-endian UTF-8 reason length, then reason bytes. Client allows up to two seconds to connect and one five-second deadline for sending plus receiving. The server reads fragmented requests, validates file readability, queues the add, and answers without waiting for the GUI. Stop joins the receiver and removes its socket file.
-
-
+**CR-1 protocol.* Sender request: one byte ASCII `A` (0x41), then a four-byte unsigned big-endian pathname byte length, then exactly that many raw UTF-8 pathname bytes (maximum 65,535). Response: one status byte (`0` accepted, `1` rejected), four-byte unsigned big-endian UTF-8 reason length, then reason bytes. Client allows up to two seconds to connect and one five-second deadline for sending plus receiving. The server reads fragmented requests, validates file readability, queues the add, and answers without waiting for the GUI.
 
 
 ## Pair programming log #############
 
-# M4 Decision Record
+Tuesday november 3rd 7:00pm
 
-See specification Section 8.
-
-tuesday november 3rd 7:00pm
-
-first 15 min - sydney driver, amruth navigator
+First 15 min - sydney driver, amruth navigator
 
 Date: Tuesday, November 3rd 2026
 Start time Sydney Driver/Amruth Navigator: 7:00pm
@@ -29,3 +23,11 @@ End time Sydnet Driver/Amruth Navigator: 7:30pm
 
 Start time Amruth Driver/Sydney Navigator: 7:30pm
 End time Amruth Driver/Sydney Navigator: 8:00pm
+
+Part worked on: The CR-1 message format and send/receive loops.
+
+My navigator contribution: I asked Amruth about how he was organizing his code and how the different parts would connect. We went over how the message length would be represented, what happens if the receiver gets an unusually large length, and how the server's response translates into exit codes 0, 1, and 2. This helped us work through some of the error-handling decisions.
+
+Amruth's navigator contribution: Amruth asked me how my program determines when it has received a complete message. I explained how I used a length prefix to tell the receiver how much data to expect. We also compared this to using a terminator byte and discussed which approach would work better with unusual filenames.
+
+What worked best: I found it helpful to explain our approaches to each other rather than just working through the code independently. Amruth also caught a few smaller details I had overlooked, and our discussion helped me better understand the reasoning behind my implementation.

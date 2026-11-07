@@ -17,7 +17,7 @@ Chunker::Chunker(ChunkingPolicy policy) : policy_(policy) {
 std::vector<Chunk> Chunker::chunk(const Document& document,
                                   std::size_t document_order) const {
     const auto tokens = TextProcessor::tokenize(document.text());
-    std::vector<Chunk> chunks
+    std::vector<Chunk> chunks;
     std::size_t start = 0;
     std::size_t sequence = 0;
 

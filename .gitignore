@@ -1,3 +1,9 @@
 build/
 *.o
 .DS_Store
+build-linux/
+
+build/
+build-linux/
+build-fault-stale/
+build-fault-failure/

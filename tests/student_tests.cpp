@@ -1,4 +1,5 @@
 // test the real main window using deterministic delays and a local socket
+
 #include "aiws/gui/workspace_widget.hpp"
 #include "aiws/gui/main_window.hpp"
 #include <QApplication>
