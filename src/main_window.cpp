@@ -399,7 +399,6 @@ void MainWindow::update_action_states() {
 }
 
 
-
 void MainWindow::invalidate_corpus() {
     ++workspace_generation_;
     corpus_current_ = false;
