@@ -399,12 +399,17 @@ void MainWindow::update_action_states() {
 }
 
 
+
 void MainWindow::invalidate_corpus() {
     ++workspace_generation_;
     corpus_current_ = false;
     processing_core_ = ProcessingCore{};
     clear_processing_outputs();
+    term_inspector_widget_->clear_statistics();
+    workspace_widget_->set_corpus_status(kCorpusNotBuilt);
 }
+
+ 
 
 void MainWindow::clear_processing_outputs() {
     // results selection details and context all depend on processing
