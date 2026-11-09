@@ -9,8 +9,7 @@ find_package(Threads REQUIRED)
 find_package(Qt6 REQUIRED COMPONENTS Widgets Test)
 set(CMAKE_AUTOMOC ON)
 
-# M4 starts from your own M3 project: copy your M3 src/ files here first.
-# Add your new M4 source files to the target where they belong.
+
 
 add_library(aiws_m2
     src/document.cpp
