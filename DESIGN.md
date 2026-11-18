@@ -1,33 +1,22 @@
-## M4 implementation decisions
+# M5 design decisions
 
-**Thread ownership.** `MainWindow` and all Qt widgets live only on the GUI thread. `MainWindow::build_corpus` copies the `Workspace`, then starts one `std::async(std::launch::async)` worker. The worker owns the snapshot and its own `ProcessingCore` and does all processing and per-document delay. `MainWindow::poll_build` is a `QTimer` member slot: it checks the future without blocking and transfers the completed `ProcessingCore` into the GUI-owned member. At exit an atomic cancellation flag interrupts artificial delays, then the future is waited on; no task is orphaned. New builds are ignored while one is running; the Build button is disabled until it finishes.
+**M4 fixes.** None identified in the supplied M4 source. Existing document loading, socket framing, search, term inspection, and context behavior are retained. The M4 build mechanism is replaced with the M5 worker and state lifecycle.
 
-**Shared mutable state (constraint 5).** No mutable Workspace, `ProcessingCore`, or widget is shared concurrently between build worker and GUI. The worker operates on its copy; the shared atomic cancellation flag is written by the GUI destructor and read by the worker; `future.get()` transfers the result only once ready. The remote-add server owns `stopping_`, its atomic stop flag, read by its receiver thread and written at shutdown. The server's listener and path are initialized before the receiver starts and cleaned after joining it. The receiver never accesses widget state directly; it queues `MainWindow::add_document_file` on the GUI thread.
+**Threads and shared data.** `MainWindow` owns Qt widgets, the live `Workspace`, `processing_core_`, `workspace_generation_`, and every `CorpusState` on the GUI thread. `BuildWorker` creates one `std::thread` in its constructor and reuses it through exit. The worker processes its own `Workspace` copy and a separate `ProcessingCore`. `BuildWorker::request` replaces an unclaimed request; `run` sleeps only for simulated build time and otherwise waits with `std::condition_variable`. `BuildWorker::stop` wakes and joins it. The only mutable data shared by the GUI and build threads is `pending_`, `serial_`, `stopping_`, and `idle_` inside `BuildWorker`; `mutex_` protects every access. `changed_` coordinates handoff and cancellation. The completion callback posts a result to the GUI with `QMetaObject::invokeMethod` and `Qt::QueuedConnection`; the worker never accesses widgets. The separate CR-1 receiver uses its existing atomic `stopping_` flag and queues document additions without touching GUI state.
 
-**Correctness.** `workspace_generation_` increases on Add Document, remote add, and Reset. A build records `build_generation_` at start. `poll_build` accepts the completed result only when these values still match. Other results are discarded. Search, inspector, and context remain disabled until a valid result is installed. Errors are caught by the worker and displayed by the GUI; the user may retry. `AIWS_FAULT_ACCEPT_STALE` bypasses the generation check; the stale-workspace test detects it. `AIWS_FAULT_LOSE_FAILURE` drops the error delivery and remains building; the failure test detects it.
+**Corpus states.** `CorpusLifecycle` holds one polymorphic `CorpusState`. State event methods select the replacement state and run the corresponding GUI-thread effect. No flag or enum selects transitions.
 
-**Changes since checkpoint.** The delayed rebuild moved into a standard-library worker. A timer checks completion. Remote Add introduced a separate Unix-domain socket thread and the same document-add invalidation path as the GUI. Existing M1/M2 interfaces and search/inspection logic did not change. This design is different from putting processing on the GUI thread, which would freeze document selection and Reset.
+| State | Meaning | Events and next state |
+|---|---|---|
+| `EmptyState` | No documents or corpus | Add becomes Dirty; Build ignored; Reset stays Empty |
+| `DirtyState` | Documents present but no valid corpus | Build becomes Building; Add remains Dirty; Reset becomes Empty |
+| `BuildingState` | Current request is running or pending | Add cancels and becomes Dirty; Reset cancels and becomes Empty; valid success becomes Ready; failure becomes Dirty; obsolete completion ignored; another Build ignored |
+| `ReadyState` | Current corpus installed | Build becomes Building; Add becomes Dirty; Reset becomes Empty |
 
-**CR-1 protocol.* Sender request: one byte ASCII `A` (0x41), then a four-byte unsigned big-endian pathname byte length, then exactly that many raw UTF-8 pathname bytes (maximum 65,535). Response: one status byte (`0` accepted, `1` rejected), four-byte unsigned big-endian UTF-8 reason length, then reason bytes. Client allows up to two seconds to connect and one five-second deadline for sending plus receiving. The server reads fragmented requests, validates file readability, queues the add, and answers without waiting for the GUI.
+Exit requests cancellation from any state. Only the GUI creates, calls, and destroys these state objects.
 
+**Event trace.** On the GUI thread, `build_corpus` calls `CorpusLifecycle::build_requested`; `DirtyState::build` calls `begin_build_work`. `BuildWorker::request` hands a snapshot to the worker. On the worker thread, `BuildWorker::run` takes it. A remote Add arrives through `RemoteAddServer::handle_client`, which queues `add_document_file` on the GUI. `BuildingState::changed` calls `BuildWorker::cancel`, invalidates the corpus, and becomes Dirty. The worker observes its changed serial and stops. A later Build submits the new snapshot to the same thread. Its completion is queued to the GUI; `BuildingState::finished` checks the generation before installing it and entering Ready.
 
-## Pair programming log #############
+**Three open decisions.** (1) Build is disabled while Building; an attempted request is ignored by `BuildingState::build`. A Workspace change cancels that build and enables a new request. (2) A remote add mid-build cancels the old job, clears search outputs, shows the added file and not-built corpus, and requires another Build; `add_document_file` and `BuildingState::changed` implement this. (3) The four mutex-protected worker fields above are the minimum shared mutable handoff, cancellation, shutdown, and idle-status data; everything else is GUI-owned or moved to the worker.
 
-Tuesday november 3rd 7:00pm
-
-First 15 min - sydney driver, amruth navigator
-
-Date: Tuesday, November 3rd 2026
-Start time Sydney Driver/Amruth Navigator: 7:00pm
-End time Sydnet Driver/Amruth Navigator: 7:30pm
-
-Start time Amruth Driver/Sydney Navigator: 7:30pm
-End time Amruth Driver/Sydney Navigator: 8:00pm
-
-Part worked on: The CR-1 message format and send/receive loops.
-
-My navigator contribution: I asked Amruth about how he was organizing his code and how the different parts would connect. We went over how the message length would be represented, what happens if the receiver gets an unusually large length, and how the server's response translates into exit codes 0, 1, and 2. This helped us work through some of the error-handling decisions.
-
-Amruth's navigator contribution: Amruth asked me how my program determines when it has received a complete message. I explained how I used a length prefix to tell the receiver how much data to expect. We also compared this to using a terminator byte and discussed which approach would work better with unusual filenames.
-
-What worked best: I found it helpful to explain our approaches to each other rather than just working through the code independently. Amruth also caught a few smaller details I had overlooked, and our discussion helped me better understand the reasoning behind my implementation.
+**Fault detection.** `AIWS_FAULT_NO_CANCEL` in `BuildWorker::delay_or_cancel` ignores obsolete requests, causing a replacement build to wait; the long-build replacement test in `student_tests.cpp` catches this. `AIWS_FAULT_SILENT_SHUTDOWN` in `BuildWorker::stop` omits the idle notification; the bounded child-process shutdown test catches the hang. Normal builds must pass `student_tests` while each faulted configuration must fail.

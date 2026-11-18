@@ -1,13 +1,12 @@
 #pragma once
 
 #include <QMainWindow>
-#include <future>
 #include <memory>
 #include <string>
 #include <cstdint>
-#include <atomic>
-#include <QTimer>
 #include "aiws/remote_add_server.hpp"
+#include "aiws/build_worker.hpp"
+#include "aiws/gui/corpus_lifecycle.hpp"
 
 #include "aiws/processing_core.hpp"
 #include "aiws/workspace.hpp"
@@ -82,7 +81,6 @@ public:
 private slots:
     /** @brief Handles a request to select and add a document to the workspace. */
     void add_document();
-    void poll_build();
 
     /** @brief Rebuilds the processing corpus from the current non-empty workspace. */
     void build_corpus();
@@ -154,23 +152,19 @@ private:
      */
     void clear_processing_outputs();
 
-    struct BuildResult {
-        ProcessingCore corpus;
-        std::string error;
-    };
     // only the gui thread owns these members
-    std::future<BuildResult> build_future_;
-    std::shared_ptr<std::atomic<bool>> build_cancel_;
-    QTimer* build_timer_{nullptr};
+    void begin_build_work();
+    void install_build_result(BuildWorker::Result&& result);
+    void report_build_failure(const std::string& error);
+
+    std::unique_ptr<BuildWorker> build_worker_;
+    std::unique_ptr<CorpusLifecycle> corpus_lifecycle_;
     std::uint64_t workspace_generation_{0};
-    std::uint64_t build_generation_{0};
-    bool building_{false};
     bool force_failure_next_{false};
     int build_delay_ms_{0};
     std::unique_ptr<aiws::RemoteAddServer> remote_add_server_;
     Workspace workspace_;
     ProcessingCore processing_core_;
-    bool corpus_current_{false};
     ExitCallback exit_callback_{nullptr};
 
     WorkspaceWidget* workspace_widget_{nullptr};

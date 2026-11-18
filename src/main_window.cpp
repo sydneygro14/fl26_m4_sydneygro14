@@ -11,10 +11,6 @@
 
 #include <QMetaObject>
 #include <QFileDevice>
-#include <QTimer>
-#include <chrono>
-#include <future>
-#include <thread>
 #include <algorithm>
 #include <memory>
 #include "aiws/remote_add_server.hpp"
@@ -106,9 +102,24 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) { // constructor
     connect(search_widget_, &SearchWidget::selected_chunk_changed,
             term_inspector_widget_, &TermInspectorWidget::set_selected_chunk);
 
-    build_timer_ = new QTimer(this);
-    build_timer_->setInterval(15);
-    connect(build_timer_, &QTimer::timeout, this, &MainWindow::poll_build);
+    // gui thread owns the states and all changes to visible corpus status
+    corpus_lifecycle_ = std::make_unique<CorpusLifecycle>(CorpusLifecycle::Effects{
+        [this]() { begin_build_work(); },
+        [this]() { if (build_worker_) build_worker_->cancel(); },
+        [this]() { if (build_worker_) build_worker_->stop(); },
+        [this]() { invalidate_corpus(); },
+        [this](BuildWorker::Result&& result) { install_build_result(std::move(result)); },
+        [this](const std::string& error) { report_build_failure(error); }
+    });
+
+    // worker sends results to the gui event queue without touching widgets
+    build_worker_ = std::make_unique<BuildWorker>([this](BuildWorker::Result&& result) {
+        auto saved = std::make_shared<BuildWorker::Result>(std::move(result));
+        QMetaObject::invokeMethod(this, [this, saved]() mutable {
+            corpus_lifecycle_->build_finished(std::move(*saved), workspace_generation_);
+            update_action_states();
+        }, Qt::QueuedConnection);
+    });
     update_action_states();
 }
 
@@ -135,7 +146,7 @@ bool MainWindow::add_document_file(const QString& path) {
     workspace_.add_document(Document(id, info.fileName().toStdString(),
                        std::string(bytes.constData(), static_cast<std::size_t>(bytes.size()))));
     workspace_widget_->add_document(info.fileName());
-    invalidate_corpus();
+    corpus_lifecycle_->workspace_changed(true);
     update_action_states();
     status_label_->setText("Added document: " + info.fileName() + " (build the corpus to search)");
     return true;
@@ -159,106 +170,41 @@ void MainWindow::fail_next_build_for_test() {
     force_failure_next_ = true;
 }
 
-// the actual rebuild runs on a standard library worker thread
+// the current state object decides whether the build request can start
 void MainWindow::build_corpus() {
-    if (workspace_.documents().empty() || building_) return;
-    // copy all input so changes and reset cannot change the worker data
-    Workspace snapshot = workspace_;
-    build_generation_ = workspace_generation_;
-    const int delay = build_delay_ms_;
-    build_cancel_ = std::make_shared<std::atomic<bool>>(false);
-    const auto cancel = build_cancel_;
+    corpus_lifecycle_->build_requested();
+    update_action_states();
+}
+
+// hand a copied workspace to the persistent worker without waiting
+void MainWindow::begin_build_work() {
     const bool inject_failure = force_failure_next_;
     force_failure_next_ = false;
-    building_ = true;
-    corpus_current_ = false;
-    // clear the old backend before starting a new build
     processing_core_ = ProcessingCore{};
     clear_processing_outputs();
     term_inspector_widget_->clear_statistics();
     workspace_widget_->set_corpus_status("Corpus: Building...");
     status_label_->setText("Building corpus...");
-    update_action_states();
-    try {
-        build_future_ = std::async(std::launch::async,
-            [snapshot = std::move(snapshot), delay, inject_failure, cancel]() mutable -> BuildResult {
-                BuildResult result;
-                try {
-                    if (inject_failure) throw std::runtime_error("simulated build failure");
-                    // delay belongs to the worker instead of the gui
-                    for (std::size_t i = 0; i < snapshot.documents().size(); ++i) {
-                        // check cancellation during each artificial delay
-                        for (int elapsed = 0; elapsed < delay && !cancel->load(); elapsed += 10) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(std::min(10, delay - elapsed)));
-                        }
-                        if (cancel->load()) return result;
-                    }
-                    if (!cancel->load()) result.corpus.rebuild(snapshot);
-                } catch (const std::exception& error) {
-                    result.error = error.what();
-                } catch (...) {
-                    result.error = "unknown build failure";
-                }
-                return result;
-            });
-        build_timer_->start();
-    } catch (const std::exception& error) {
-        building_ = false;
-        invalidate_corpus();
-        update_action_states();
-        status_label_->setText(QString("Build failed: ") + error.what());
-    }
+    build_worker_->request(workspace_, workspace_generation_, build_delay_ms_, inject_failure);
 }
 
-// the gui checks completion without ever waiting for the worker
-void MainWindow::poll_build() {
-    if (!building_ || !build_future_.valid()) return;
-    if (build_future_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
-    build_timer_->stop();
-    BuildResult result;
-    try {
-        result = build_future_.get();
-    } catch (const std::exception& error) {
-        result.error = error.what();
-    } catch (...) {
-        result.error = "unknown build failure";
-    }
-    // this fault intentionally keeps the application stuck in building state
-#ifndef AIWS_FAULT_LOSE_FAILURE
-    if (!result.error.empty() && build_generation_ == workspace_generation_) {
-        building_ = false;
-        invalidate_corpus();
-        update_action_states();
-        status_label_->setText(QString("Build failed: ") + QString::fromStdString(result.error));
-        return;
-    }
-#else
-    if (!result.error.empty() && build_generation_ == workspace_generation_) {
-        // deliberately drop the failure notification and stay in building state
-        return;
-    }
-#endif
-    building_ = false;
-    // a completed build must match the exact workspace version it started with
-#ifndef AIWS_FAULT_ACCEPT_STALE
-    if (build_generation_ != workspace_generation_) {
-        update_action_states();
-        return;
-    }
-#endif
-    if (!result.error.empty()) {
-        invalidate_corpus();
-        update_action_states();
-        status_label_->setText(QString("Build failed: ") + QString::fromStdString(result.error));
-        return;
-    }
+// install results only after the building state checks the generation
+void MainWindow::install_build_result(BuildWorker::Result&& result) {
     processing_core_ = std::move(result.corpus);
     clear_processing_outputs();
     term_inspector_widget_->clear_statistics();
-    corpus_current_ = true;
-    workspace_widget_->set_corpus_status(QString("Corpus: %1 chunks").arg(processing_core_.chunk_count()));
-    update_action_states();
+    workspace_widget_->set_corpus_status(
+        QString("Corpus: %1 chunks").arg(processing_core_.chunk_count()));
     status_label_->setText("Corpus built");
+}
+
+// failed builds return to the dirty state so the next build can run
+void MainWindow::report_build_failure(const std::string& error) {
+    processing_core_ = ProcessingCore{};
+    clear_processing_outputs();
+    term_inspector_widget_->clear_statistics();
+    workspace_widget_->set_corpus_status(kCorpusNotBuilt);
+    status_label_->setText("Build failed: " + QString::fromStdString(error));
 }
 
 // the socket server only queues work for the gui and never waits for it
@@ -280,13 +226,11 @@ bool MainWindow::start_remote_add(const std::string& socket_path) {
     return true;
 }
 
-// stop listening and wait for the worker before deleting its owner
+// stop the receiver and join the build thread before destroying its owner
 MainWindow::~MainWindow() {
-    if (build_timer_) build_timer_->stop();
-    // cancel long simulated delays so exiting does not wait for them
-    if (build_cancel_) build_cancel_->store(true);
-    if (build_future_.valid()) build_future_.wait();
     if (remote_add_server_) remote_add_server_->stop();
+    if (corpus_lifecycle_) corpus_lifecycle_->exit();
+    if (build_worker_) build_worker_->stop();
 }
 
 void MainWindow::document_selected(int row) {
@@ -304,7 +248,7 @@ void MainWindow::document_selected(int row) {
 
 void MainWindow::search_requested(const QString& query, int k) {
     // search is only valid for a current corpus and a non blank query
-    if (!corpus_current_ || query.trimmed().isEmpty()) return;
+    if (!corpus_lifecycle_->can_process() || query.trimmed().isEmpty()) return;
 
     // new rows replace the old ones and drop the old selection and details
     // and the stale context goes with them
@@ -325,7 +269,7 @@ void MainWindow::query_changed(const QString&) {
 
 void MainWindow::build_context_requested(int token_budget) {
     // context uses the current query and k and never the displayed rows (riskier to read from frontend)
-    if (!corpus_current_ || !search_widget_->has_query()) return; // checks if corpus is not updated or if query is blank
+    if (!corpus_lifecycle_->can_process() || !search_widget_->has_query()) return; // checks if corpus is not updated or if query is blank
     const std::vector<ContextItem> items = processing_core_.build_context( // asks backend to build context
         search_widget_->query().toStdString(), search_widget_->result_count(), // query, k, and slider budget
         static_cast<std::size_t>(token_budget));
@@ -349,7 +293,7 @@ void MainWindow::source_document_requested(const QString& document_id) {
 // The app clears the DF/TF numbers and asks for a single word instead of crashing.
 void MainWindow::term_inspection_requested(const QString& term, const QString& chunk_id) {
     // inspection needs a current corpus and a non blank term
-    if (!corpus_current_ || term.trimmed().isEmpty()) return;
+    if (!corpus_lifecycle_->can_process() || term.trimmed().isEmpty()) return;
 
     // chunk frequency is only available when a result chunk is selected
     const std::string text = term.toStdString();
@@ -369,10 +313,8 @@ void MainWindow::term_inspection_requested(const QString& term, const QString& c
 
 void MainWindow::reset_application() {
     // empty workspace and backend corpus before the components reset
-    ++workspace_generation_;
     workspace_.clear(); // clears workspace
-    processing_core_.rebuild(workspace_); // "rebuilds" backend from nothing so it actually clears it
-    corpus_current_ = false;
+    corpus_lifecycle_->reset();
 
     // every component resets through the common interface
     Resettable* const components[] = {workspace_widget_, search_widget_,
@@ -394,16 +336,15 @@ void MainWindow::update_action_states() {
     const bool has_documents = !workspace_.documents().empty(); // makes sure workspace has documents
     const bool has_query = search_widget_->has_query(); // makes sure there is a q
     // query typed
-    workspace_widget_->set_build_corpus_enabled(has_documents && !building_); // enables
-    search_widget_->set_search_enabled(corpus_current_ && has_query);
-    term_inspector_widget_->set_inspection_enabled(corpus_current_);
-    context_widget_->set_build_context_enabled(corpus_current_ && has_query);
+    workspace_widget_->set_build_corpus_enabled(has_documents && corpus_lifecycle_->can_build()); // enables
+    search_widget_->set_search_enabled(corpus_lifecycle_->can_process() && has_query);
+    term_inspector_widget_->set_inspection_enabled(corpus_lifecycle_->can_process());
+    context_widget_->set_build_context_enabled(corpus_lifecycle_->can_process() && has_query);
 }
 
 void MainWindow::invalidate_corpus() {
     // old corpus and everything derived from it can no longer be used
     ++workspace_generation_;
-    corpus_current_ = false;
     processing_core_ = ProcessingCore{};
     clear_processing_outputs();
     term_inspector_widget_->clear_statistics();

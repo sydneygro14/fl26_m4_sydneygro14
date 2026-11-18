@@ -1,11 +1,14 @@
 // test the real main window using deterministic delays and a local socket
 
+#include "aiws/build_worker.hpp"
+#include "aiws/gui/corpus_lifecycle.hpp"
 #include "aiws/gui/workspace_widget.hpp"
 #include "aiws/gui/main_window.hpp"
 #include <QApplication>
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QMetaObject>
+#include <QProcess>
 #include <QFile>
 #include <QLabel>
 #include <QListWidget>
@@ -17,6 +20,10 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <vector>
+#include <utility>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -90,6 +97,26 @@ static bool socket_request(const QString& name, const QByteArray& path, bool one
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
+    // child checks that stopping an idle worker returns without hanging
+    if (argc > 1 && std::string(argv[1]) == "--idle-worker-exit") {
+        aiws::BuildWorker worker([](aiws::BuildWorker::Result&&) {});
+        QThread::msleep(150);
+        return 0;
+    }
+
+    // a separate process bounds idle shutdown so the test can fail quickly
+    {
+        QProcess child;
+        child.start(QCoreApplication::applicationFilePath(), {"--idle-worker-exit"});
+        if (!child.waitForStarted(1000)) return 34;
+        if (!child.waitForFinished(1700)) {
+            child.kill();
+            child.waitForFinished(1000);
+            return 35;
+        }
+        if (child.exitStatus() != QProcess::NormalExit || child.exitCode() != 0) return 36;
+    }
+
     QTemporaryDir folder;
     if (!folder.isValid()) return 1;
     const QString first = folder.filePath("first.txt");
@@ -153,6 +180,81 @@ int main(int argc, char** argv) {
         QMetaObject::invokeMethod(workspace, "build_corpus_requested", Qt::DirectConnection);
     }
     if (QFile::exists(folder.filePath("aiws.sock"))) return 21;
+    // one worker must handle repeated builds on the same thread
+    // a cancelled long build must not delay a newer build
+    {
+        std::mutex mutex;
+        std::condition_variable ready;
+        std::vector<std::pair<std::uint64_t, std::thread::id>> finished;
+        aiws::BuildWorker worker([&](aiws::BuildWorker::Result&& result) {
+            std::lock_guard<std::mutex> lock(mutex);
+            finished.emplace_back(result.generation, result.thread_id);
+            ready.notify_all();
+        });
+        aiws::Workspace many;
+        for (int i = 0; i < 8; ++i) {
+            many.add_document(aiws::Document("long-" + std::to_string(i),
+                                             "long", "shared words for corpus building"));
+        }
+        aiws::Workspace one;
+        one.add_document(aiws::Document("new", "new", "new document text"));
+        worker.request(std::move(many), 100, 400, false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        worker.cancel();
+        worker.request(one, 101, 120, false);
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (!ready.wait_for(lock, std::chrono::milliseconds(1400), [&] {
+                    return !finished.empty();
+                })) return 22;
+            if (finished.front().first != 101) return 23;
+        }
+        worker.request(one, 102, 0, false);
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (!ready.wait_for(lock, std::chrono::milliseconds(1000), [&] {
+                    return finished.size() >= 2;
+                })) return 24;
+            if (finished.back().first != 102) return 25;
+            if (finished.front().second != finished.back().second) return 26;
+        }
+        worker.stop();
+    }
+
+    // lifecycle state objects handle build reset and stale completion events
+    {
+        std::uint64_t generation = 0;
+        int builds = 0;
+        int cancellations = 0;
+        int installs = 0;
+        aiws::gui::CorpusLifecycle lifecycle({
+            [&] { ++builds; },
+            [&] { ++cancellations; },
+            [] {},
+            [&] { ++generation; },
+            [&](aiws::BuildWorker::Result&&) { ++installs; },
+            [&](const std::string&) {}
+        });
+        if (lifecycle.can_build() || lifecycle.can_process()) return 27;
+        lifecycle.workspace_changed(true);
+        if (!lifecycle.can_build()) return 28;
+        lifecycle.build_requested();
+        if (!lifecycle.is_building() || builds != 1) return 29;
+        lifecycle.workspace_changed(true);
+        if (lifecycle.is_building() || cancellations != 1) return 30;
+        lifecycle.build_requested();
+        aiws::BuildWorker::Result stale;
+        stale.generation = generation - 1;
+        lifecycle.build_finished(std::move(stale), generation);
+        if (!lifecycle.is_building() || installs != 0) return 31;
+        aiws::BuildWorker::Result current;
+        current.generation = generation;
+        lifecycle.build_finished(std::move(current), generation);
+        if (!lifecycle.can_process() || installs != 1) return 32;
+        lifecycle.reset();
+        if (lifecycle.can_build() || lifecycle.can_process()) return 33;
+    }
+
     std::cout << "student tests passed\n";
     return 0;
 }
